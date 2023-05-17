@@ -21,6 +21,7 @@ from torch_geometric.loader import DataLoader
 NUM_NODE_ATTR = 119
 NUM_NODE_CHIRAL = 4
 NUM_BOND_ATTR = 4
+
 criterion = nn.CrossEntropyLoss()
 
 
@@ -140,54 +141,60 @@ class VectorQuantizer(nn.Module):
         # initialize embeddings
         self.embeddings = nn.Embedding(self.num_embeddings, self.embedding_dim)
 
-    def forward(self, x, e):
-        encoding_indices = self.get_code_indices(x, e)  # x: B * H, encoding_indices: B
+    def forward(self, x, node_rep):
+        encoding_indices = self.get_code_indices(x, node_rep)  # x: B * H, encoding_indices: B
         quantized = self.quantize(encoding_indices)
-        # embedding loss: move the embeddings towards the encoder's output
-        q_latent_loss = F.mse_loss(quantized, e.detach())
-        # commitment loss
-        e_latent_loss = F.mse_loss(e, quantized.detach())
+        # VQ loss: move the embeddings towards the encoder's output, update the codebook
+        q_latent_loss = F.mse_loss(quantized, node_rep.detach())
+        # commitment loss: encourages the output of the encoder to stay close to the chosen codebook embedding, update the encoder
+        e_latent_loss = F.mse_loss(node_rep, quantized.detach())
         loss = q_latent_loss + self.commitment_cost * e_latent_loss
         # Straight Through Estimator
-        quantized = e + (quantized - e).detach().contiguous()
+        quantized = node_rep + (quantized - node_rep).detach().contiguous()
         return quantized, loss
 
-    def get_code_indices(self, x, e):
-        # x: N * 2  e: N * E
+    def get_code_indices(self, x, node_rep):
+        # x: node features of original graph with shape (b, 2) and the fist column denotes the atom type.
+        # node_rep: node representation of the encoded graph with shape (b, d_embedding).
+
+        # get the indices of C, N, O and others, all bool tensor with shape (b, ).
         atom_type = x[:, 0]
         index_c = atom_type == 5
         index_n = atom_type == 6
         index_o = atom_type == 7
-        index_others = ~(index_c + index_n + index_o)
+        # in python: ~ denotes not, | denotes or, & denotes and.
+        index_others = ~(index_c + index_n + index_o)  # means not one or more of C, N, O.
+
         # compute L2 distance
-        encoding_indices = torch.ones(e.size(0)).long().to(e.device)
-        # C:
+        # TODO: what this computation means? How to compute the L2 distance using below code?
+        encoding_indices = torch.ones(node_rep.size(0)).long().to(node_rep.device)
+        # C: the context-aware C atom embeddings are the first 377 embeddings in the codebook
         distances = (
-            torch.sum(e[index_c] ** 2, dim=1, keepdim=True)
+            torch.sum(node_rep[index_c] ** 2, dim=1, keepdim=True)
             + torch.sum(self.embeddings.weight[0:377] ** 2, dim=1)
-            - 2.0 * torch.matmul(e[index_c], self.embeddings.weight[0:377].t())
+            - 2.0 * torch.matmul(node_rep[index_c], self.embeddings.weight[0:377].t())
         )
         encoding_indices[index_c] = torch.argmin(distances, dim=1)
-        # N:
+        # N: the context-aware N atom embeddings are the next 55 embeddings in the codebook
         distances = (
-            torch.sum(e[index_n] ** 2, dim=1, keepdim=True)
+            torch.sum(node_rep[index_n] ** 2, dim=1, keepdim=True)
             + torch.sum(self.embeddings.weight[378:433] ** 2, dim=1)
-            - 2.0 * torch.matmul(e[index_n], self.embeddings.weight[378:433].t())
+            - 2.0 * torch.matmul(node_rep[index_n], self.embeddings.weight[378:433].t())
         )
         encoding_indices[index_n] = torch.argmin(distances, dim=1) + 378
-        # O:
+        # O: the context-aware O atom embeddings are the next 54 embeddings in the codebook
         distances = (
-            torch.sum(e[index_o] ** 2, dim=1, keepdim=True)
+            torch.sum(node_rep[index_o] ** 2, dim=1, keepdim=True)
             + torch.sum(self.embeddings.weight[434:488] ** 2, dim=1)
-            - 2.0 * torch.matmul(e[index_o], self.embeddings.weight[434:488].t())
+            - 2.0 * torch.matmul(node_rep[index_o], self.embeddings.weight[434:488].t())
         )
         encoding_indices[index_o] = torch.argmin(distances, dim=1) + 434
 
-        # Others:
+        # Others: others: the context-aware other atom embeddings are the last 22 embeddings in the codebook
         distances = (
-            torch.sum(e[index_others] ** 2, dim=1, keepdim=True)
+            torch.sum(node_rep[index_others] ** 2, dim=1, keepdim=True)
             + torch.sum(self.embeddings.weight[489:511] ** 2, dim=1)
-            - 2.0 * torch.matmul(e[index_others], self.embeddings.weight[489:511].t())
+            - 2.0 * torch.matmul(node_rep[index_others], self.embeddings.weight[489:511].t())
         )
         encoding_indices[index_others] = torch.argmin(distances, dim=1) + 489
         return encoding_indices
@@ -230,6 +237,8 @@ def sce_loss(x, y, alpha=1):
 
 
 def train_vae(args, epoch, model_list, loader, optimizer_list, device):
+    # vq-vae training function
+
     criterion = nn.CrossEntropyLoss()
 
     model, vq_layer, dec_pred_atoms, dec_pred_bonds, dec_pred_atoms_chiral = model_list
@@ -243,15 +252,20 @@ def train_vae(args, epoch, model_list, loader, optimizer_list, device):
     if dec_pred_bonds is not None:
         dec_pred_bonds.train()
 
-    loss_accum = 0
+    loss_accumulation = 0
     epoch_iter = tqdm(loader, desc="Iteration")
     for step, batch in enumerate(epoch_iter):
         batch = batch.to(device)
+        # get node representation
         node_rep = model(batch.x, batch.edge_index, batch.edge_attr)
-        # e, e_q_loss = vq_layer(node_rep, ,node_rep)
-        e, e_q_loss = vq_layer(node_rep, node_rep)
+
+        # get quantized node representation and VQ loss + commitment loss
+        # TODO: fix this line --> e, e_q_loss = vq_layer(node_rep, ,node_rep)
+        e, e_q_loss = vq_layer(batch.x, node_rep)  # fixed
         pred_node = dec_pred_atoms(e, batch.edge_index, batch.edge_attr)
         pred_node_chiral = dec_pred_atoms_chiral(e, batch.edge_index, batch.edge_attr)
+
+        # compute loss of reconstruction: atom type + chiral type + bond type (if applicable)
         atom_loss = criterion(pred_node, batch.x[:, 0])
         atom_chiral_loss = criterion(pred_node_chiral, batch.x[:, 1])
         recon_loss = atom_loss + atom_chiral_loss
@@ -261,7 +275,10 @@ def train_vae(args, epoch, model_list, loader, optimizer_list, device):
             pred_edge = dec_pred_bonds(edge_rep, batch.edge_index, batch.edge_attr)
             recon_loss += criterion(pred_edge, batch.edge_attr[:, 0])
 
+        # compute total loss: reconstruction loss + quantization loss ()
         loss = recon_loss + e_q_loss
+
+        # optimize
         optimizer_model.zero_grad()
         optimizer_model_vq.zero_grad()
         optimizer_dec_pred_atoms.zero_grad()
@@ -279,10 +296,10 @@ def train_vae(args, epoch, model_list, loader, optimizer_list, device):
         if optimizer_dec_pred_bonds is not None:
             optimizer_dec_pred_bonds.step()
 
-        loss_accum += float(loss.cpu().item())
+        loss_accumulation += float(loss.cpu().item())
         epoch_iter.set_description(f"Epoch: {epoch} train_loss: {loss.item():.4f}")
 
-    return loss_accum / step
+    return loss_accumulation / step
 
 
 def main():
@@ -296,7 +313,7 @@ def main():
 
     parser.add_argument("--emb_dim", type=int, default=300, help="embedding dimensions (default: 300)")
     parser.add_argument("--num_tokens", type=int, default=512, help="number of atom tokens (default: 512)")
-    parser.add_argument("--commitment_cost", type=float, default=0.25, help="commitment_cost")
+    parser.add_argument("--commitment_cost", type=float, default=0.25, help="commitment_cost")  # what is this?
     parser.add_argument("--edge", type=int, default=1, help="whether to decode edges or not together with atoms")
 
     parser.add_argument("--dropout_ratio", type=float, default=0.0, help="dropout ratio (default: 0)")
@@ -327,7 +344,10 @@ def main():
     # molecule example: Data(x=[30, 2], id=[1], edge_index=[2, 66], edge_attr=[66, 2])
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
-    # set up models, check if checkpoint exists
+    ###
+    # set up components for vq-vae and training.
+
+    # Encoder: encode node features to get context-aware node representations / atom embeddings
     model = GNN(args.num_layer, args.emb_dim).to(device)
     if args.input_model_file is not None and args.input_model_file != "":
         model.load_state_dict(torch.load(args.input_model_file))
@@ -336,11 +356,17 @@ def main():
     else:
         resume = False
 
+    # Quantizer: looks up the nearest code in codebook for each encoder output(node representation / atom embedding)
+    # to get discrete latent representation (node's index in codebook / dictionary) and the corresponding embedding vector
     vq_layer = VectorQuantizer(args.emb_dim, args.num_tokens, args.commitment_cost).to(device)
+
+    # Decoder: reconstruct the input molecule graph.
+    # reconstruct atom types
     atom_pred_decoder = GNNDecoder(args.emb_dim, NUM_NODE_ATTR, JK=args.JK, gnn_type=args.gnn_type).to(device)
+    # reconstruct atom chirality
     atom_chiral_pred_decoder = GNNDecoder(args.emb_dim, NUM_NODE_CHIRAL, JK=args.JK, gnn_type=args.gnn_type).to(device)
-    if args.edge:   # whether to decode edges or not together with atoms
-        NUM_BOND_ATTR = 4
+    if args.edge:  # whether to decode edges or not together with atoms
+        # reconstruct bond types
         bond_pred_decoder = GNNDecoder(args.emb_dim, NUM_BOND_ATTR, JK=args.JK, gnn_type="linear").to(device)
         optimizer_dec_pred_bonds = optim.Adam(bond_pred_decoder.parameters(), lr=args.lr, weight_decay=args.decay)
     else:
@@ -348,14 +374,16 @@ def main():
         optimizer_dec_pred_bonds = None
 
     model_list = [model, vq_layer, atom_pred_decoder, bond_pred_decoder, atom_chiral_pred_decoder]
+    ###
 
     # set up optimizers
     optimizer_model = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     optimizer_model_vq = optim.Adam(vq_layer.parameters(), lr=args.lr, weight_decay=args.decay)
     optimizer_dec_pred_atoms = optim.Adam(atom_pred_decoder.parameters(), lr=args.lr, weight_decay=args.decay)
     optimizer_dec_pred_atoms_chiral = optim.Adam(atom_chiral_pred_decoder.parameters(), lr=args.lr, weight_decay=args.decay)
-    optimizer_dec_pred_atoms_chiral = optim.Adam(atom_chiral_pred_decoder.parameters(), lr=args.lr, weight_decay=args.decay)
+    optimizer_list = [optimizer_model, optimizer_model_vq, optimizer_dec_pred_atoms, optimizer_dec_pred_bonds, optimizer_dec_pred_atoms_chiral]
 
+    # set up scheduler
     if args.use_scheduler:
         print("--------- Use scheduler -----------")
 
@@ -370,13 +398,13 @@ def main():
         scheduler_model = None
         scheduler_dec = None
 
-    optimizer_list = [optimizer_model, optimizer_model_vq, optimizer_dec_pred_atoms, optimizer_dec_pred_bonds, optimizer_dec_pred_atoms_chiral]
     output_file_temp = "./checkpoints/" + args.output_model_file
     for epoch in range(1, args.epochs + 1):
         print("====epoch " + str(epoch))
         train_loss = train_vae(args, epoch, model_list, loader, optimizer_list, device)
         if not resume:
-            if epoch == 30:
+            # if epoch == 30:
+            if epoch == 1:
                 torch.save(model.state_dict(), output_file_temp + f"vqencoder.pth")
                 torch.save(vq_layer.state_dict(), output_file_temp + f"vqquantizer.pth")
         print(train_loss)
