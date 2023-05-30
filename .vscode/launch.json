@@ -5,14 +5,25 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "vqvae tokenizer",
+            "name": "MolrBERT PreTrain",
+            "type": "python",
+            "request": "launch",
+            "program": "pretrain.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--device=7",
+            ]
+        },
+        {
+            "name": "MoleBERT-Tokenizer Train",
             "type": "python",
             "request": "launch",
             "program": "vqvae.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--output_model_file=./tokenizer",
+                "--output_model_file=./MoleBERT-Tokenizer",
                 "--device=7",
                 "--batch_size=1"
             ]
